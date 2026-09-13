@@ -63,5 +63,3 @@ python -m pip install pytest build
 python -m pytest
 python -m build
 ```
-
-The GitHub Actions release workflow builds a wheel and source archive on tags matching `v*`, then uploads them to GitHub Packages using `GITHUB_TOKEN`.
