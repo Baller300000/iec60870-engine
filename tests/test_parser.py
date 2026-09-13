@@ -1,4 +1,4 @@
-from iec60870 import FrameStatus, T104Session, parse_asdu, parse_frame
+from iec60870 import FrameStatus, FrameStream, T104Session, decode_cp56time2a, parse_asdu, parse_frame
 
 
 def variable_frame(asdu: bytes, address: bytes = b"\x01") -> bytes:
@@ -35,6 +35,7 @@ def test_t101_checksum_corruption():
 
 def test_fixed_frame_and_short_frame():
     assert parse_frame(b"\x10\x00\x01\x01\x16", protocol="t101").status is FrameStatus.VALID
+    assert parse_frame(b"\x10\x00\x34\x12\x46\x16", protocol="t103").fields["link_address"] == 0x1234
     assert parse_frame(b"\x68\x04\x04", protocol="t101").status is FrameStatus.INCOMPLETE
 
 
@@ -64,3 +65,33 @@ def test_type_30_sequence_objects():
     result = parse_asdu(data)
     assert result["status"] == "VALID"
     assert [item["ioa"] for item in result["information_objects"]] == [10, 11]
+
+
+def test_cp56time2a_decoding():
+    assert decode_cp56time2a(bytes([0xD2, 0x04, 0x2A, 0x0D, 0x09, 0x06, 0x1A])) == {
+        "millisecond": 234,
+        "second": 1,
+        "minute": 42,
+        "hour": 13,
+        "day": 9,
+        "month": 6,
+        "year": 2026,
+    }
+
+
+def test_frame_stream_handles_chunks_and_multiple_frames():
+    first = variable_frame(single_point_asdu(1))
+    second = variable_frame(single_point_asdu(2))
+    stream = FrameStream(protocol="t101")
+    assert stream.feed(first[:4]) == []
+    results = stream.feed(first[4:] + second)
+    assert [result.status for result in results] == [FrameStatus.VALID, FrameStatus.VALID]
+    assert results[1].fields["asdu"]["information_objects"][0]["ioa"] == 2
+    assert stream.buffered_bytes == b""
+
+
+def test_frame_stream_resynchronizes_after_corruption():
+    stream = FrameStream(protocol="t101")
+    results = stream.feed(b"\x00" + variable_frame(single_point_asdu()))
+    assert results[0].status is FrameStatus.CORRUPTED
+    assert results[1].status is FrameStatus.VALID

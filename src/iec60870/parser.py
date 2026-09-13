@@ -6,7 +6,7 @@ bytes may make a frame valid and CORRUPTED when the bytes contradict the format.
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 
 class FrameStatus(str, Enum):
@@ -44,6 +44,76 @@ class T104Session:
         return result
 
 
+class FrameStream:
+    """Incremental tokenizer for buffers containing zero or more frames."""
+
+    def __init__(
+        self,
+        *,
+        protocol: str = "auto",
+        link_address_size: Optional[int] = None,
+        parse_asdu_data: bool = True,
+    ) -> None:
+        self.protocol = protocol
+        self.link_address_size = link_address_size
+        self.parse_asdu_data = parse_asdu_data
+        self._buffer = bytearray()
+
+    @property
+    def buffered_bytes(self) -> bytes:
+        """Return the unconsumed partial frame held by the tokenizer."""
+        return bytes(self._buffer)
+
+    def feed(self, data: bytes) -> List[ParseResult]:
+        """Consume bytes and return every complete or corrupted frame result."""
+        try:
+            self._buffer.extend(data)
+        except (TypeError, ValueError):
+            return [_result(FrameStatus.CORRUPTED, self.protocol, error="data must be bytes-like")]
+        results: List[ParseResult] = []
+        while self._buffer:
+            candidate_length = self._candidate_length()
+            if candidate_length is None:
+                break
+            result = parse_frame(
+                self._buffer[:candidate_length],
+                protocol=self.protocol,
+                link_address_size=self.link_address_size,
+                parse_asdu_data=self.parse_asdu_data,
+            )
+            if result.status is FrameStatus.INCOMPLETE:
+                break
+            if result.status is FrameStatus.VALID:
+                results.append(result)
+                del self._buffer[:result.frame_length or len(self._buffer)]
+                continue
+            results.append(result)
+            del self._buffer[0]
+        return results
+
+    def _candidate_length(self) -> Optional[int]:
+        """Return the first frame length when its header is available."""
+        if not self._buffer:
+            return None
+        selected = self.protocol.lower()
+        if selected in {"t101", "t103"} or selected == "auto":
+            if self._buffer[0] not in (0x10, 0x68):
+                return 1
+            address_size = self.link_address_size or (2 if self.protocol.lower() == "t103" else 1)
+            if self._buffer[0] == 0x10:
+                return 4 + address_size if len(self._buffer) >= 4 + address_size else None
+            if len(self._buffer) < 4:
+                return None
+            if self._buffer[3] == 0x68:
+                return self._buffer[1] + 6 if len(self._buffer) >= self._buffer[1] + 6 else None
+            if selected == "auto":
+                return self._buffer[1] + 2
+            return 1
+        if len(self._buffer) < 2:
+            return None
+        return self._buffer[1] + 2
+
+
 def _u16le(data: Sequence[int], offset: int) -> int:
     return data[offset] | (data[offset + 1] << 8)
 
@@ -66,21 +136,27 @@ def _parse_ft12(
     if not data:
         return _result(FrameStatus.INCOMPLETE, protocol, error="empty buffer")
     if data[0] == 0x10:
-        if len(data) < 5:
+        total = 4 + link_address_size
+        if len(data) < total:
             return _result(FrameStatus.INCOMPLETE, protocol, frame_type="fixed")
-        if data[4] != 0x16:
+        if data[total - 1] != 0x16:
             return _result(FrameStatus.CORRUPTED, protocol, frame_type="fixed", error="bad fixed-frame stop")
-        checksum = sum(data[1:3]) & 0xFF
-        if checksum != data[3]:
+        checksum_offset = total - 2
+        checksum = sum(data[1:checksum_offset]) & 0xFF
+        if checksum != data[checksum_offset]:
             return _result(FrameStatus.CORRUPTED, protocol, frame_type="fixed", error="checksum mismatch")
-        if len(data) > 5:
+        if len(data) > total:
             return _result(FrameStatus.CORRUPTED, protocol, frame_type="fixed", error="trailing bytes")
         return _result(
             FrameStatus.VALID,
             protocol,
-            frame_length=5,
+            frame_length=total,
             frame_type="fixed",
-            fields={"control": data[1], "link_address": data[2], "checksum": data[3]},
+            fields={
+                "control": data[1],
+                "link_address": int.from_bytes(data[2:checksum_offset], "little"),
+                "checksum": data[checksum_offset],
+            },
         )
     if data[0] != 0x68:
         return _result(FrameStatus.CORRUPTED, protocol, error="unknown FT1.2 start")
@@ -134,6 +210,8 @@ def _parse_t104(
     apdu_length = data[1]
     if apdu_length < 4:
         return _result(FrameStatus.CORRUPTED, protocol, error="APCI length is below four control bytes")
+    if apdu_length > 253:
+        return _result(FrameStatus.CORRUPTED, protocol, error="APCI length exceeds 253-byte limit")
     total = apdu_length + 2
     if len(data) < total:
         return _result(FrameStatus.INCOMPLETE, protocol, frame_length=total)
@@ -150,11 +228,15 @@ def _parse_t104(
         asdu_start = 6
     elif (control[0] & 3) == 1:
         frame_type = "S"
+        if control[1] != 0:
+            return _result(FrameStatus.CORRUPTED, protocol, frame_type=frame_type, error="non-zero reserved S-format bits")
         receive_sequence = ((control[3] << 8) | control[2]) >> 1
         fields = {"receive_sequence": receive_sequence}
         asdu_start = total
     else:
         frame_type = "U"
+        if control[1] != 0 or control[2] != 0 or control[3] != 0:
+            return _result(FrameStatus.CORRUPTED, protocol, frame_type=frame_type, error="non-zero reserved U-format bits")
         code = control[0] & 0xFC
         u_names = {0x04: "STARTDT act", 0x08: "STARTDT con", 0x10: "STOPDT act", 0x20: "STOPDT con", 0x40: "TESTFR act", 0x80: "TESTFR con"}
         fields = {"u_function": u_names.get(code, "UNKNOWN"), "u_code": code}
@@ -240,7 +322,26 @@ def parse_asdu(data: bytes, *, ioa_size: int = 3, cot_size: int = 2, coa_size: i
             item["value"] = raw[offset]
             offset += 1
             if type_id == 30:
-                item["cp56time2a"] = raw[offset:offset + 7]
+                timestamp = raw[offset:offset + 7]
+                item["cp56time2a"] = timestamp
+                item["timestamp"] = decode_cp56time2a(timestamp)
                 offset += 7
         objects.append(item)
     return {"status": FrameStatus.VALID.value, "type_id": type_id, "vsq": vsq, "count": count, "sequence": sequence, "cot": cot, "common_address": common_address, "information_objects": objects, "unparsed": raw[offset:]}
+
+
+def decode_cp56time2a(data: bytes) -> Dict[str, int]:
+    """Decode CP56Time2a calendar fields without timezone conversion."""
+    raw = bytes(data)
+    if len(raw) != 7:
+        raise ValueError("CP56Time2a requires exactly 7 bytes")
+    milliseconds = raw[0] | (raw[1] << 8)
+    return {
+        "millisecond": milliseconds % 1000,
+        "second": milliseconds // 1000,
+        "minute": raw[2] & 0x3F,
+        "hour": raw[3] & 0x1F,
+        "day": raw[4] & 0x1F,
+        "month": raw[5] & 0x0F,
+        "year": 2000 + (raw[6] & 0x7F),
+    }
