@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "iec60870-parser"
-version = "0.1.0"
+version = "0.1.1"
 description = "Zero-dependency IEC 60870-5-101/103/104 frame parser"
 readme = "README.md"
 requires-python = ">=3.9"
